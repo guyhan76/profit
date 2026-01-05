@@ -1,7 +1,4 @@
-# app.py
-
-
-
+# app.py  (v0.6.3 UI 유지 + 5개 회사 입력/합산 지원 + LEGACY 완전 제거 + 기존데이터 완전삭제/정리)
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -11,15 +8,6 @@ import os
 from dataclasses import dataclass
 from datetime import datetime
 
-# ✅ Matplotlib (Altair 회피)
-import matplotlib.pyplot as plt
-
-# PDF (ReportLab)
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
 
 # Optional PDF merge (if installed)
 try:
@@ -32,7 +20,7 @@ except Exception:
 # =============================
 # App Meta
 # =============================
-APP_VERSION = "0.6.2"  # ✅ 업데이트 버전(Altair 회피 패치)
+APP_VERSION = "0.6.4"  # ✅ v0.6.3 UI 유지 + 회사별 저장/합산 + LEGACY 제거/정리
 DEVELOPER_NAME = "한동석"
 COPYRIGHT_TEXT = f"© {datetime.now().year} {DEVELOPER_NAME}. All rights reserved."
 DB_PATH = "mvp_finance.db"
@@ -41,35 +29,98 @@ st.set_page_config(page_title="원가·손익·BEP 경영분석", layout="wide")
 
 
 # =============================
-# DB
+# 회사 설정 (✅ LEGACY 제거)
+# =============================
+COMPANIES = [
+    "신한포장",
+    "진성디앤피",
+    "화진포장",
+    "성화티앤피",
+    "도희팩",
+]
+GROUP_OPTION = "전체(합산)"
+
+
+# =============================
+# DB (회사+연도+월)
 # =============================
 def db_conn():
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    return conn
+
+
+def _table_has_company_column(conn: sqlite3.Connection) -> bool:
+    try:
+        cur = conn.execute("PRAGMA table_info(periods)")
+        cols = [r[1] for r in cur.fetchall()]
+        return "company" in cols
+    except Exception:
+        return False
+
+
+def ensure_db_schema(conn: sqlite3.Connection):
+    """
+    ✅ 정책 변경:
+    - LEGACY 사용 안 함
+    - 기존(company 컬럼 없는) 옛 periods 테이블이면 → 기존데이터 '완전 삭제'하고 새 스키마로 재생성
+    - company 컬럼 있는 경우에도 5개 회사 외 데이터는 자동 삭제
+    """
+    # periods 테이블 존재 여부
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='periods'")
+    exists = cur.fetchone() is not None
+
+    if exists and (not _table_has_company_column(conn)):
+        # ✅ 옛 구조 테이블 → 완전 삭제 후 새로 생성 (사용자 요청: 기존 데이터 삭제)
+        conn.execute("DROP TABLE IF EXISTS periods")
+        conn.commit()
+
+    # 새 스키마 생성
     conn.execute("""
     CREATE TABLE IF NOT EXISTS periods (
+        company TEXT NOT NULL,
         year INTEGER NOT NULL,
         month INTEGER NOT NULL,
         payload TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        PRIMARY KEY (year, month)
+        PRIMARY KEY (company, year, month)
     )
     """)
-    return conn
+    conn.commit()
+
+    # ✅ 5개 회사 외 데이터 정리 (LEGACY 포함)
+    placeholders = ",".join(["?"] * len(COMPANIES))
+    conn.execute(f"DELETE FROM periods WHERE company NOT IN ({placeholders})", COMPANIES)
+    conn.commit()
 
 
-def save_period(year: int, month: int, payload: dict):
+def purge_all_data():
+    """✅ 전체 데이터 완전 삭제(5개 회사 포함 전부 삭제)"""
     conn = db_conn()
+    ensure_db_schema(conn)
+    conn.execute("DELETE FROM periods")
+    conn.commit()
+    conn.close()
+
+
+def save_period(company: str, year: int, month: int, payload: dict):
+    if company not in COMPANIES:
+        raise ValueError("회사명이 유효하지 않습니다.")
+    conn = db_conn()
+    ensure_db_schema(conn)
     conn.execute(
-        "INSERT OR REPLACE INTO periods(year, month, payload, updated_at) VALUES (?,?,?,?)",
-        (year, month, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"))
+        "INSERT OR REPLACE INTO periods(company, year, month, payload, updated_at) VALUES (?,?,?,?,?)",
+        (company, year, month, json.dumps(payload, ensure_ascii=False), datetime.now().isoformat(timespec="seconds"))
     )
     conn.commit()
     conn.close()
 
 
-def load_period(year: int, month: int) -> dict:
+def load_period(company: str, year: int, month: int) -> dict:
+    if company not in COMPANIES:
+        return {}
     conn = db_conn()
-    cur = conn.execute("SELECT payload FROM periods WHERE year=? AND month=?", (year, month))
+    ensure_db_schema(conn)
+    cur = conn.execute("SELECT payload FROM periods WHERE company=? AND year=? AND month=?", (company, year, month))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -80,21 +131,39 @@ def load_period(year: int, month: int) -> dict:
         return {}
 
 
-def list_periods():
+def list_periods(company: str | None = None):
     conn = db_conn()
-    cur = conn.execute("SELECT year, month, updated_at FROM periods ORDER BY year DESC, month DESC")
+    ensure_db_schema(conn)
+    if company and company in COMPANIES:
+        cur = conn.execute(
+            "SELECT company, year, month, updated_at FROM periods WHERE company=? ORDER BY year DESC, month DESC",
+            (company,)
+        )
+    else:
+        cur = conn.execute(
+            "SELECT company, year, month, updated_at FROM periods ORDER BY year DESC, month DESC"
+        )
     rows = cur.fetchall()
     conn.close()
     return rows
 
 
-def load_periods_range(year: int, months: list[int]) -> list[dict]:
+def load_periods_range(company: str, year: int, months: list[int]) -> list[dict]:
+    if company not in COMPANIES:
+        return []
     if not months:
         return []
     conn = db_conn()
+    ensure_db_schema(conn)
+
     placeholders = ",".join(["?"] * len(months))
-    query = f"SELECT month, payload FROM periods WHERE year=? AND month IN ({placeholders}) ORDER BY month"
-    cur = conn.execute(query, [year, *months])
+    query = f"""
+        SELECT month, payload
+        FROM periods
+        WHERE company=? AND year=? AND month IN ({placeholders})
+        ORDER BY month
+    """
+    cur = conn.execute(query, [company, year, *months])
     rows = cur.fetchall()
     conn.close()
 
@@ -110,15 +179,62 @@ def load_periods_range(year: int, months: list[int]) -> list[dict]:
     return out
 
 
-def delete_period(year: int, month: int):
+def load_periods_range_group(year: int, months: list[int], companies: list[str]) -> list[dict]:
+    if not months:
+        return []
+    companies = [c for c in companies if c in COMPANIES]
+    if not companies:
+        return []
+
     conn = db_conn()
+    ensure_db_schema(conn)
+
+    placeholders_m = ",".join(["?"] * len(months))
+    placeholders_c = ",".join(["?"] * len(companies))
+    query = f"""
+        SELECT company, month, payload
+        FROM periods
+        WHERE year=? AND month IN ({placeholders_m}) AND company IN ({placeholders_c})
+        ORDER BY month, company
+    """
+    cur = conn.execute(query, [year, *months, *companies])
+    rows = cur.fetchall()
+    conn.close()
+
+    by_month = {int(m): [] for m in months}
+    for c, m, payload_json in rows:
+        try:
+            payload = json.loads(payload_json)
+        except Exception:
+            payload = {}
+        by_month[int(m)].append((str(c), payload))
+
+    out = []
+    for m in months:
+        out.append({"_year": int(year), "_month": int(m), "_payloads": by_month.get(int(m), [])})
+    return out
+
+
+def delete_period(company: str, year: int, month: int):
+    if company not in COMPANIES:
+        return
+    conn = db_conn()
+    ensure_db_schema(conn)
+    conn.execute("DELETE FROM periods WHERE company=? AND year=? AND month=?", (company, year, month))
+    conn.commit()
+    conn.close()
+
+
+def delete_period_all_companies(year: int, month: int):
+    conn = db_conn()
+    ensure_db_schema(conn)
     conn.execute("DELETE FROM periods WHERE year=? AND month=?", (year, month))
     conn.commit()
     conn.close()
 
 
 # =============================
-# Tax (KR) - annualized estimate
+# Tax (KR) - annualized estimate (기존 유지)
 # =============================
 def corp_tax_national_kr(tax_base_krw: float) -> float:
     tb = max(0.0, float(tax_base_krw))
@@ -166,7 +282,7 @@ def estimate_monthly_tax_from_pretax_annualized(monthly_pretax: float, include_l
 
 
 # =============================
-# Helpers
+# Helpers (기존 유지)
 # =============================
 def safe_div(a: float, b: float) -> float:
     return a / b if b else 0.0
@@ -229,30 +345,8 @@ def months_for_period(selected_month: int, kind: str) -> list[int]:
     return list(range(1, 13))
 
 
-# ✅ Altair 회피: Matplotlib 라인차트
-def plot_lines_matplotlib(df: pd.DataFrame, title: str, height_px: int = 320):
-    """
-    df: index = x축(월), columns = series
-    """
-    if df is None or df.empty:
-        st.info("그래프를 표시할 데이터가 없습니다.")
-        return
-
-    # 높이 픽셀을 인치로 대략 변환(96dpi 가정)
-    fig_h = max(2.5, height_px / 120)
-    fig, ax = plt.subplots(figsize=(10, fig_h))
-    for col in df.columns:
-        ax.plot(df.index, df[col].values, marker="o", label=str(col))
-    ax.set_title(title)
-    ax.set_xlabel("월")
-    ax.set_ylabel("금액")
-    ax.grid(True, alpha=0.3)
-    ax.legend()
-    st.pyplot(fig, clear_figure=True)
-
-
 # =============================
-# Default templates
+# Default templates (기존 유지)
 # =============================
 DEFAULT_COST_ITEMS = {
     "직접재료비": [
@@ -283,10 +377,11 @@ DEFAULT_COST_ITEMS = {
         "공구기구비/소모품",
         "안전/방역/청소비",
         "공장 임차료",
+        "운반구렌탈료",
         "보험료(공장/설비)",
-        "차량관리비(공장)",
+        "차량관리비(화물차)",
         "운반비(공장 내/외)",
-        "설비 감가상각비",
+        "기계.설비 감가상각비",
         "공장 건물 감가상각비",
         "기타 제조간접비"
     ]
@@ -346,7 +441,7 @@ def build_default_nonop_rows(items):
 
 
 # =============================
-# Core compute
+# Core compute (기존 유지)
 # =============================
 @dataclass
 class PeriodInput:
@@ -456,62 +551,107 @@ def payload_to_period_input(payload: dict) -> PeriodInput:
     )
 
 
-def aggregate_periods(payloads: list[dict]) -> dict:
-    total = {
+# =============================
+# ✅ 합산 로직 (회사별 payload를 합쳐 1개 payload처럼 계산)
+# =============================
+def merge_payloads_for_group(payloads: list[tuple[str, dict]]) -> dict:
+    merged = {
         "sales": 0.0,
-        "cogs": 0.0,
-        "gross_profit": 0.0,
-        "sga_total": 0.0,
-        "sga_fixed": 0.0,
-        "sga_variable": 0.0,
-        "op_profit": 0.0,
-        "nonop_income": 0.0,
-        "nonop_expense": 0.0,
-        "pretax": 0.0,
-        "tax": 0.0,
-        "net_income": 0.0,
-        "variable_total": 0.0,
-        "months_included": [],
+        "beg_fg": 0.0,
+        "end_fg": 0.0,
+        "cost_items": build_default_cost_items(),
+        "sga_rows": [],
+        "nonop_income_rows": [],
+        "nonop_expense_rows": [],
+        "tax_mode": "OFF",
+        "tax_manual": 0.0,
+        "include_local_tax": True,
+        "_tax_sum_override": 0.0,
+        "_tax_info_note": "합산 세금 = 회사별 산출 tax 합계(AUTO/MANUAL/OFF 포함)",
+        "_companies_included": [],
     }
 
-    for payload in payloads:
+    sga_map = {}  # (item, type) -> amount
+    noi_map = {}  # item -> amount
+    noe_map = {}  # item -> amount
+
+    tax_sum = 0.0
+    included = []
+
+    for company, payload in payloads:
+        if company not in COMPANIES:
+            continue
+        if not payload:
+            continue
+
+        included.append(company)
+
         p = payload_to_period_input(payload)
         out = compute_all(p)
 
-        total["sales"] += p.sales
-        total["cogs"] += out["cogs"]
-        total["gross_profit"] += out["gross_profit"]
-        total["sga_total"] += out["sga_total"]
-        total["sga_fixed"] += out["sga_fixed"]
-        total["sga_variable"] += out["sga_variable"]
-        total["op_profit"] += out["op_profit"]
-        total["nonop_income"] += out["nonop_income"]
-        total["nonop_expense"] += out["nonop_expense"]
-        total["pretax"] += out["pretax"]
-        total["tax"] += out["tax"]
-        total["net_income"] += out["net_income"]
-        total["variable_total"] += out["variable_total"]
-        total["months_included"].append(int(payload.get("_month", 0)))
+        merged["sales"] += p.sales
+        merged["beg_fg"] += p.beg_fg
+        merged["end_fg"] += p.end_fg
 
-    cm = total["sales"] - total["variable_total"]
-    cm_ratio = safe_div(cm, total["sales"])
-    grade = grade_cm_ratio(cm_ratio)
-    bep_sales = safe_div(total["sga_fixed"], cm_ratio) if cm_ratio > 0 else 0.0
+        for sec in ["직접재료비", "직접노무비", "제조간접비"]:
+            sec_dict = payload.get("cost_items", {}).get(sec, {}) if payload.get("cost_items") else {}
+            if not isinstance(sec_dict, dict):
+                sec_dict = {}
+            for k, v in sec_dict.items():
+                merged["cost_items"][sec][k] = float(merged["cost_items"][sec].get(k, 0.0)) + float(v or 0.0)
 
-    total.update({
-        "cm": cm,
-        "cm_ratio": cm_ratio,
-        "grade": grade,
-        "bep_sales": bep_sales,
-        "gap_sales_vs_bep": total["sales"] - bep_sales,
-        "gross_profit_rate": safe_div(total["gross_profit"], total["sales"]),
-        "op_margin": safe_div(total["op_profit"], total["sales"]),
-    })
-    return total
+        for r in payload.get("sga_rows", []) or []:
+            item = str(r.get("item", "")).strip()
+            typ = normalize_sga_type(str(r.get("type", "고정")))
+            amt = float(r.get("amount", 0.0) or 0.0)
+            if not item:
+                continue
+            sga_map[(item, typ)] = float(sga_map.get((item, typ), 0.0)) + amt
+
+        for r in payload.get("nonop_income_rows", []) or []:
+            item = str(r.get("item", "")).strip()
+            amt = float(r.get("amount", 0.0) or 0.0)
+            if item:
+                noi_map[item] = float(noi_map.get(item, 0.0)) + amt
+
+        for r in payload.get("nonop_expense_rows", []) or []:
+            item = str(r.get("item", "")).strip()
+            amt = float(r.get("amount", 0.0) or 0.0)
+            if item:
+                noe_map[item] = float(noe_map.get(item, 0.0)) + amt
+
+        tax_sum += float(out.get("tax", 0.0) or 0.0)
+
+    merged["sga_rows"] = [{"item": k[0], "type": k[1], "amount": float(v)} for k, v in sga_map.items()]
+    merged["nonop_income_rows"] = [{"item": k, "amount": float(v)} for k, v in noi_map.items()]
+    merged["nonop_expense_rows"] = [{"item": k, "amount": float(v)} for k, v in noe_map.items()]
+
+    merged["_tax_sum_override"] = tax_sum
+    merged["_companies_included"] = included
+
+    return merged
+
+
+def compute_all_group(payloads: list[tuple[str, dict]]) -> tuple[PeriodInput, dict]:
+    merged_payload = merge_payloads_for_group(payloads)
+    p = payload_to_period_input(merged_payload)
+    out = compute_all(p)
+
+    tax_sum = float(merged_payload.get("_tax_sum_override", 0.0) or 0.0)
+    out["tax"] = tax_sum
+    out["tax_info"] = {
+        "annualized_tax_base": 0.0,
+        "monthly_tax": tax_sum,
+        "detail": {"national_cit": 0.0, "local_income_tax": 0.0, "total_tax": tax_sum, "assumption": merged_payload.get("_tax_info_note", "")},
+        "note": merged_payload.get("_tax_info_note", ""),
+    }
+    out["net_income"] = out["pretax"] - out["tax"]
+    out["gap_sales_vs_bep"] = p.sales - out["bep_sales"]
+    return p, out
 
 
 # =============================
-# DataFrames
+# DataFrames (기존 유지)
 # =============================
 def df_cost_statement(cost_items: dict, cogm: float) -> pd.DataFrame:
     rows = []
@@ -603,7 +743,7 @@ def build_agg_pl_df(agg: dict) -> pd.DataFrame:
 
 
 # =============================
-# Report builders
+# Report builders (기존 유지)
 # =============================
 def build_report_html(title: str, period_label: str, sales_base: float, out: dict,
                       df_pl: pd.DataFrame, df_cost: pd.DataFrame | None,
@@ -612,10 +752,10 @@ def build_report_html(title: str, period_label: str, sales_base: float, out: dic
     if tax_info:
         d = tax_info["detail"]
         tax_note = f"""
-        <p><b>법인세(추정) 기준</b><br/>
-        연환산 과세표준: {tax_info["annualized_tax_base"]:,.0f}원<br/>
-        국세 법인세: {d["national_cit"]:,.0f}원 / 지방소득세(가정): {d["local_income_tax"]:,.0f}원<br/>
-        ({d["assumption"]})
+        <p><b>법인세(표시/추정)</b><br/>
+        연환산 과세표준: {tax_info.get("annualized_tax_base", 0):,.0f}원<br/>
+        국세 법인세: {d.get("national_cit", 0):,.0f}원 / 지방소득세(가정): {d.get("local_income_tax", 0):,.0f}원<br/>
+        ({d.get("assumption", "")})
         </p>
         """
     else:
@@ -655,7 +795,7 @@ def build_report_html(title: str, period_label: str, sales_base: float, out: dic
     <hr/>
     <p><small>
     ※ 본 리포트는 경영관리 목적의 자동 산출 결과입니다.
-    특히 법인세는 '연환산 추정' 기반으로 실제 신고세액과 차이가 있을 수 있습니다.
+    특히 법인세는 추정/합산 방식에 따라 실제 신고세액과 차이가 있을 수 있습니다.
     </small></p>
     """
     return html
@@ -702,10 +842,10 @@ def make_pdf_report(title: str, period_label: str, sales_base: float, out: dict,
     y -= (line * 1.2)
 
     if tax_info:
-        d = tax_info["detail"]
-        c.drawString(18 * mm, y, f"법인세(추정): {tax_info['note']}")
+        d = tax_info.get("detail", {})
+        c.drawString(18 * mm, y, f"법인세(표시): {tax_info.get('note','')}")
         y -= line
-        c.drawString(18 * mm, y, f"- 연환산 과세표준 {to_money(tax_info['annualized_tax_base'])} | 국세 {to_money(d['national_cit'])} + 지방(10%가정) {to_money(d['local_income_tax'])}")
+        c.drawString(18 * mm, y, f"- 합계 {to_money(d.get('total_tax',0))}")
         y -= (line * 1.2)
     else:
         if tax_mode == "OFF":
@@ -805,58 +945,84 @@ def build_compare_report_html(title: str, label_a: str, label_b: str,
 
 
 # =============================
-# Trend / Compare
+# Trend / Compare (회사/합산 대응)
 # =============================
-def build_year_month_table_for_trend(year: int) -> pd.DataFrame:
-    payloads = load_periods_range(year, list(range(1, 13)))
-    if not payloads:
-        return pd.DataFrame(columns=[
-            "월", "매출액", "영업이익", "당기순이익",
-            "누적매출", "누적영업이익", "누적당기순이익",
-            "공헌이익률", "BEP매출액"
-        ])
+def aggregate_periods(payloads: list[dict]) -> dict:
+    total = {
+        "sales": 0.0,
+        "cogs": 0.0,
+        "gross_profit": 0.0,
+        "sga_total": 0.0,
+        "sga_fixed": 0.0,
+        "sga_variable": 0.0,
+        "op_profit": 0.0,
+        "nonop_income": 0.0,
+        "nonop_expense": 0.0,
+        "pretax": 0.0,
+        "tax": 0.0,
+        "net_income": 0.0,
+        "variable_total": 0.0,
+        "months_included": [],
+    }
 
-    rows = []
-    for pp in payloads:
-        m = int(pp.get("_month", 0))
-        p = payload_to_period_input(pp)
+    for payload in payloads:
+        p = payload_to_period_input(payload)
         out = compute_all(p)
-        rows.append({
-            "월": m,
-            "매출액": p.sales,
-            "영업이익": out["op_profit"],
-            "당기순이익": out["net_income"],
-            "공헌이익률": out["cm_ratio"],
-            "BEP매출액": out["bep_sales"],
-        })
 
-    df = pd.DataFrame(rows).sort_values("월")
-    df["누적매출"] = df["매출액"].cumsum()
-    df["누적영업이익"] = df["영업이익"].cumsum()
-    df["누적당기순이익"] = df["당기순이익"].cumsum()
-    return df
+        total["sales"] += p.sales
+        total["cogs"] += out["cogs"]
+        total["gross_profit"] += out["gross_profit"]
+        total["sga_total"] += out["sga_total"]
+        total["sga_fixed"] += out["sga_fixed"]
+        total["sga_variable"] += out["sga_variable"]
+        total["op_profit"] += out["op_profit"]
+        total["nonop_income"] += out["nonop_income"]
+        total["nonop_expense"] += out["nonop_expense"]
+        total["pretax"] += out["pretax"]
+        total["tax"] += out["tax"]
+        total["net_income"] += out["net_income"]
+        total["variable_total"] += out["variable_total"]
+        total["months_included"].append(int(payload.get("_month", 0)))
+
+    cm = total["sales"] - total["variable_total"]
+    cm_ratio = safe_div(cm, total["sales"])
+    grade = grade_cm_ratio(cm_ratio)
+    bep_sales = safe_div(total["sga_fixed"], cm_ratio) if cm_ratio > 0 else 0.0
+
+    total.update({
+        "cm": cm,
+        "cm_ratio": cm_ratio,
+        "grade": grade,
+        "bep_sales": bep_sales,
+        "gap_sales_vs_bep": total["sales"] - bep_sales,
+        "gross_profit_rate": safe_div(total["gross_profit"], total["sales"]),
+        "op_margin": safe_div(total["op_profit"], total["sales"]),
+    })
+    return total
 
 
-def build_period_aggregate(year: int, anchor_month: int, kind: str) -> tuple[dict, str, list[int]]:
-    months = months_for_period(anchor_month, kind)
-    payloads = load_periods_range(year, months)
+def aggregate_periods_group(year: int, months: list[int], companies: list[str]) -> tuple[dict, list[int]]:
+    month_pack = load_periods_range_group(year, months, companies)
 
-    if kind == "월별(선택월)":
-        label = f"{year}-{anchor_month:02d}"
-    elif kind == "분기누적(QTD)":
-        q = (anchor_month - 1) // 3 + 1
-        label = f"{year} Q{q} (저장분)"
-    elif kind == "연도누적(YTD)":
-        label = f"{year} YTD (저장분)"
-    else:
-        label = f"{year} 연도전체(저장분)"
+    payloads_merged_month = []
+    included_months = []
 
-    if not payloads:
-        return {}, label, []
+    for pack in month_pack:
+        m = int(pack.get("_month", 0))
+        payloads = pack.get("_payloads", [])
+        if not payloads:
+            continue
+        merged_payload = merge_payloads_for_group(payloads)
+        merged_payload["_year"] = int(year)
+        merged_payload["_month"] = int(m)
+        payloads_merged_month.append(merged_payload)
+        included_months.append(m)
 
-    agg = aggregate_periods(payloads)
-    included = sorted([int(x) for x in agg.get("months_included", []) if x])
-    return agg, label, included
+    if not payloads_merged_month:
+        return {}, []
+
+    agg = aggregate_periods(payloads_merged_month)
+    return agg, sorted(included_months)
 
 
 def compare_two(agg_a: dict, agg_b: dict) -> pd.DataFrame:
@@ -898,31 +1064,71 @@ def compare_two(agg_a: dict, agg_b: dict) -> pd.DataFrame:
 
 
 # =============================
-# UI
+# 앱 시작 시 DB 스키마/정리 1회 보장
+# =============================
+_conn_boot = db_conn()
+ensure_db_schema(_conn_boot)
+_conn_boot.close()
+
+
+# =============================
+# UI (v0.6.3 형태 유지 + 회사 선택)
 # =============================
 st.title("제조원가·손익·BEP 경영분석 앱")
 
 with st.sidebar:
-    st.header("연도/월 선택")
+    st.header("회사/연도/월 선택")
+
+    # ✅ 회사 목록: LEGACY 없음
+    company_selected = st.selectbox("회사", options=[GROUP_OPTION] + COMPANIES, index=0)
+
     now = datetime.now()
     year = st.number_input("연도", value=now.year, min_value=2000, max_value=2100, step=1)
     month = st.number_input("월", value=now.month, min_value=1, max_value=12, step=1)
 
-    saved = list_periods()
+    st.divider()
+
+    saved = list_periods(company_selected if company_selected != GROUP_OPTION else None)
     if saved:
         st.caption("저장된 월")
-        st.dataframe(pd.DataFrame(saved, columns=["year", "month", "updated_at"]),
-                     use_container_width=True, hide_index=True)
+        df_saved = pd.DataFrame(saved, columns=["company", "year", "month", "updated_at"])
+        if company_selected != GROUP_OPTION:
+            df_saved = df_saved[df_saved["company"] == company_selected]
+        st.dataframe(df_saved, use_container_width=True, hide_index=True)
 
     st.divider()
     st.subheader("데이터 삭제")
     confirm = st.checkbox("정말 삭제합니다(되돌릴 수 없음).")
-    if st.button("선택한 연/월 완전 삭제", use_container_width=True, disabled=not confirm):
-        delete_period(int(year), int(month))
-        st.success("삭제 완료")
+
+    if company_selected == GROUP_OPTION:
+        if st.button("선택한 연/월 (전체회사) 삭제", use_container_width=True, disabled=not confirm):
+            delete_period_all_companies(int(year), int(month))
+            st.success("삭제 완료")
+            st.rerun()
+    else:
+        if st.button("선택한 회사/연/월 삭제", use_container_width=True, disabled=not confirm):
+            delete_period(company_selected, int(year), int(month))
+            st.success("삭제 완료")
+            st.rerun()
+
+    st.divider()
+    st.subheader("전체 초기화(모든 회사/모든 월)")
+    if st.button("⚠️ DB 전체 데이터 완전 삭제", use_container_width=True, disabled=not confirm):
+        purge_all_data()
+        st.success("전체 데이터 삭제 완료")
         st.rerun()
 
-defaults = load_period(int(year), int(month))
+
+# =============================
+# 아래부터는 이전 v0.6.3-multi 코드와 동일 흐름
+# (입력/결과/누적/리포트/비교 탭)
+# =============================
+
+# ✅ defaults 로딩 (합산은 입력 탭에서 직접 입력 불가 → 안내)
+if company_selected == GROUP_OPTION:
+    defaults = {}
+else:
+    defaults = load_period(company_selected, int(year), int(month))
 
 
 def dget(key, fallback):
@@ -934,206 +1140,234 @@ beg_fg_default = float(dget("beg_fg", 0.0))
 end_fg_default = float(dget("end_fg", 0.0))
 
 cost_items_default = dget("cost_items", None) or build_default_cost_items()
-sga_rows_default = dget("sga_rows", None) or build_default_sga_rows()
-nonop_income_default = dget("nonop_income_rows", None) or build_default_nonop_rows(DEFAULT_NONOP_INCOME)
-nonop_expense_default = dget("nonop_expense_rows", None) or build_default_nonop_rows(DEFAULT_NONOP_EXPENSE)
 tax_mode_default = dget("tax_mode", "AUTO")
 tax_manual_default = float(dget("tax_manual", 0.0))
 include_local_default = bool(dget("include_local_tax", True))
 auto_dm_default = bool(dget("auto_dm_used", True))
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["입력", "결과", "누적 조회", "리포트 다운로드", "비교분석·추이그래프"])
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["입력", "결과", "누적 조회", "리포트 다운로드", "비교분석"])
 
 
 # -----------------------------
-# TAB1: INPUT
+# TAB1: INPUT (회사별 입력만 허용)
 # -----------------------------
 with tab1:
     st.subheader("1) 입력")
-    st.caption("※ 브라우저 자동 번역이 켜져 있으면 항목명이 왜곡될 수 있습니다. '이 사이트 번역 안 함' 권장.")
 
-    left, right = st.columns(2)
+    if company_selected == GROUP_OPTION:
+        st.info("‘전체(합산)’은 입력이 아니라 **회사별로 저장된 값을 자동 합산**해서 보여줍니다.\n\n좌측에서 회사(신한포장/진성디앤피/화진포장/성화티앤피/도희팩) 선택 후 입력/저장해 주세요.")
+    else:
+        left, right = st.columns(2)
 
-    with left:
-        st.markdown("### 매출 / 완제품 재고")
-        sales = st.number_input("매출액", value=sales_default, step=1000.0, format="%.0f")
-        beg_fg = st.number_input("기초 완제품 재고", value=beg_fg_default, step=1000.0, format="%.0f")
-        end_fg = st.number_input("기말 완제품 재고", value=end_fg_default, step=1000.0, format="%.0f")
+        with left:
+            st.markdown("### 매출 / 완제품 재고")
+            sales = st.number_input("매출액", value=sales_default, step=1000.0, format="%.0f")
+            beg_fg = st.number_input("기초 완제품 재고", value=beg_fg_default, step=1000.0, format="%.0f")
+            end_fg = st.number_input("기말 완제품 재고", value=end_fg_default, step=1000.0, format="%.0f")
 
-        st.markdown("### 제조원가명세서")
-        st.info(
-            "당기제조원가 = 직접재료비(당기사용원재료만) + 직접노무비 + 제조간접비\n\n"
-            "직접재료비는 원재료만, 부재료/외주가공비/포장재/소모품은 제조간접비\n\n"
-            "옵션 ON 시: 당기사용원재료 = (기초원재료 + 당기원재료입고 - 기말원재료)"
-        )
+            st.markdown("### 제조원가명세서")
+            st.info(
+                "당기제조원가 = 직접재료비(당기사용원재료만) + 직접노무비 + 제조간접비\n\n"
+                "직접재료비는 원재료만, 부재료/외주가공비/포장재/소모품은 제조간접비\n\n"
+                "옵션 ON 시: 당기사용원재료 = (기초원재료 + 당기원재료입고 - 기말원재료)"
+            )
 
-        auto_dm_used = st.toggle("당기사용원재료 자동계산(기초+입고-기말, 음수면 0)", value=auto_dm_default)
+            auto_dm_used = st.toggle("당기사용원재료 자동계산(기초+입고-기말, 음수면 0)", value=auto_dm_default)
 
-        cost_items = {}
-        for sec in ["직접재료비", "직접노무비", "제조간접비"]:
-            with st.expander(sec, expanded=True if sec != "제조간접비" else False):
-                cost_items[sec] = {}
+            cost_items = {}
+            for sec in ["직접재료비", "직접노무비", "제조간접비"]:
+                with st.expander(sec, expanded=True if sec != "제조간접비" else False):
+                    cost_items[sec] = {}
 
-                if sec == "직접재료비":
-                    dm_sec_default = cost_items_default.get(sec, {})
+                    if sec == "직접재료비":
+                        dm_sec_default = cost_items_default.get(sec, {})
 
-                    beg = st.number_input(
-                        "기초원재료", value=float(dm_sec_default.get("기초원재료", 0.0)),
-                        step=1000.0, format="%.0f", help="참고용", key="dm_beg"
-                    )
+                        beg = st.number_input(
+                            "기초원재료", value=float(dm_sec_default.get("기초원재료", 0.0)),
+                            step=1000.0, format="%.0f", help="참고용", key="dm_beg"
+                        )
 
-                    inbound_default = dm_sec_default.get("당기원재료입고", None)
-                    if inbound_default is None:
-                        inbound_default = dm_sec_default.get("당기원재료매입", 0.0)
+                        inbound_default = dm_sec_default.get("당기원재료입고", None)
+                        if inbound_default is None:
+                            inbound_default = dm_sec_default.get("당기원재료매입", 0.0)
 
-                    inbound = st.number_input(
-                        "당기원재료입고", value=float(inbound_default or 0.0),
-                        step=1000.0, format="%.0f", help="입고 기준(실물/수불 기준)", key="dm_inbound"
-                    )
+                        inbound = st.number_input(
+                            "당기원재료입고", value=float(inbound_default or 0.0),
+                            step=1000.0, format="%.0f", help="입고 기준(실물/수불 기준)", key="dm_inbound"
+                        )
 
-                    end = st.number_input(
-                        "기말원재료", value=float(dm_sec_default.get("기말원재료", 0.0)),
-                        step=1000.0, format="%.0f", help="참고용", key="dm_end"
-                    )
+                        end = st.number_input(
+                            "기말원재료", value=float(dm_sec_default.get("기말원재료", 0.0)),
+                            step=1000.0, format="%.0f", help="참고용", key="dm_end"
+                        )
 
-                    raw_used = float(beg) + float(inbound) - float(end)
-                    auto_used = max(0.0, raw_used)
+                        raw_used = float(beg) + float(inbound) - float(end)
+                        auto_used = max(0.0, raw_used)
 
-                    used_default = float(dm_sec_default.get("당기사용원재료", 0.0))
-                    used_val = auto_used if auto_dm_used else st.number_input(
-                        "당기사용원재료(원가반영)", value=used_default,
-                        step=1000.0, format="%.0f",
-                        help="원가에 반영되는 직접재료비(원재료 사용액)", disabled=auto_dm_used,
-                        key="dm_used_manual"
-                    )
+                        used_default = float(dm_sec_default.get("당기사용원재료", 0.0))
+                        used_val = auto_used if auto_dm_used else st.number_input(
+                            "당기사용원재료(원가반영)", value=used_default,
+                            step=1000.0, format="%.0f",
+                            help="원가에 반영되는 직접재료비(원재료 사용액)", disabled=auto_dm_used,
+                            key="dm_used_manual"
+                        )
 
-                    if auto_dm_used:
-                        if raw_used < 0:
-                            st.warning(f"자동계산(기초+입고-기말) = {to_money(raw_used)} → 음수이므로 0으로 보정되었습니다.")
-                        st.caption(f"자동계산된 당기사용원재료(원가반영): {to_money(used_val)}")
+                        if auto_dm_used:
+                            if raw_used < 0:
+                                st.warning(f"자동계산(기초+입고-기말) = {to_money(raw_used)} → 음수이므로 0으로 보정되었습니다.")
+                            st.caption(f"자동계산된 당기사용원재료(원가반영): {to_money(used_val)}")
 
-                    cost_items[sec]["기초원재료"] = float(beg)
-                    cost_items[sec]["당기원재료입고"] = float(inbound)
-                    cost_items[sec]["기말원재료"] = float(end)
-                    cost_items[sec]["당기사용원재료"] = float(used_val)
+                        cost_items[sec]["기초원재료"] = float(beg)
+                        cost_items[sec]["당기원재료입고"] = float(inbound)
+                        cost_items[sec]["기말원재료"] = float(end)
+                        cost_items[sec]["당기사용원재료"] = float(used_val)
 
+                    else:
+                        item_names = list(cost_items_default.get(sec, {}).keys())
+                        for i, item in enumerate(item_names):
+                            val = float(cost_items_default.get(sec, {}).get(item, 0.0))
+                            amt = st.number_input(item, value=val, step=1000.0, format="%.0f", key=f"cost_{sec}_{i}")
+                            cost_items[sec][item] = float(amt)
+
+                        st.caption("필요 시 항목 추가(선택)")
+                        new_name = st.text_input(f"{sec} 추가 항목명", value="", key=f"new_{sec}")
+                        if new_name.strip():
+                            if new_name not in cost_items[sec]:
+                                amt = st.number_input(
+                                    f"[추가] {new_name}", value=0.0, step=1000.0, format="%.0f",
+                                    key=f"cost_{sec}_add_{abs(hash(new_name))}"
+                                )
+                                cost_items[sec][new_name] = float(amt)
+
+        with right:
+            st.markdown("### 판매관리비 (고정비/변동비)")
+
+            sga_rows_work = st.session_state.get("sga_rows_work", build_default_sga_rows())
+            sga_rows = []
+
+            for i, r in enumerate(sga_rows_work):
+                c1, c2, c3 = st.columns([3, 1.5, 2.5])
+                with c1:
+                    item = st.text_input("항목", value=r.get("item", ""), key=f"sga_item_{i}")
+                with c2:
+                    typ0 = normalize_sga_type(r.get("type", "고정"))
+                    typ = st.selectbox("구분", ["고정", "변동"], index=["고정", "변동"].index(typ0), key=f"sga_type_{i}")
+                with c3:
+                    amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"sga_amt_{i}")
+                sga_rows.append({"item": item, "type": typ, "amount": float(amt)})
+
+            st.session_state["sga_rows_work"] = sga_rows
+
+            st.divider()
+            st.caption("판관비 항목 추가(선택)")
+            add_name = st.text_input("새 판관비 항목명", value="", key="sga_new_name")
+            add_type = st.selectbox("새 항목 구분", ["고정", "변동"], key="sga_new_type")
+            add_amt = st.number_input("새 항목 금액", value=0.0, step=1000.0, format="%.0f", key="sga_new_amt")
+
+            if st.button("판관비 항목 추가", use_container_width=True):
+                if add_name.strip():
+                    st.session_state["sga_rows_work"] = st.session_state["sga_rows_work"] + [{
+                        "item": add_name.strip(),
+                        "type": add_type,
+                        "amount": float(add_amt)
+                    }]
+                    st.success("추가됨! (저장 버튼을 누르면 다음에도 유지됩니다)")
+                    st.rerun()
                 else:
-                    for item in list(cost_items_default.get(sec, {}).keys()):
-                        val = float(cost_items_default.get(sec, {}).get(item, 0.0))
-                        amt = st.number_input(item, value=val, step=1000.0, format="%.0f", key=f"{sec}_{item}")
-                        cost_items[sec][item] = float(amt)
+                    st.warning("항목명을 입력해 주세요.")
 
-                    st.caption("필요 시 항목 추가(선택)")
-                    new_name = st.text_input(f"{sec} 추가 항목명", value="", key=f"new_{sec}")
-                    if new_name.strip():
-                        if new_name not in cost_items[sec]:
-                            amt = st.number_input(
-                                f"[추가] {new_name}", value=0.0, step=1000.0, format="%.0f", key=f"{sec}_add_{new_name}"
-                            )
-                            cost_items[sec][new_name] = float(amt)
+            st.markdown("### 영업외 수익/비용")
+            with st.expander("영업외수익", expanded=False):
+                nonop_income_rows = []
+                for i, r in enumerate(st.session_state.get("nonop_income_work", build_default_nonop_rows(DEFAULT_NONOP_INCOME))):
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        item = st.text_input("항목", value=r.get("item", ""), key=f"noi_item_{i}")
+                    with c2:
+                        amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"noi_amt_{i}")
+                    nonop_income_rows.append({"item": item, "amount": float(amt)})
+                st.session_state["nonop_income_work"] = nonop_income_rows
 
-    with right:
-        st.markdown("### 판매관리비 (고정비/변동비)")
-    
+            with st.expander("영업외비용", expanded=False):
+                nonop_expense_rows = []
+                for i, r in enumerate(st.session_state.get("nonop_expense_work", build_default_nonop_rows(DEFAULT_NONOP_EXPENSE))):
+                    c1, c2 = st.columns([3, 2])
+                    with c1:
+                        item = st.text_input("항목", value=r.get("item", ""), key=f"noe_item_{i}")
+                    with c2:
+                        amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"noe_amt_{i}")
+                    nonop_expense_rows.append({"item": item, "amount": float(amt)})
+                st.session_state["nonop_expense_work"] = nonop_expense_rows
 
-        sga_rows = []
-        for i, r in enumerate(sga_rows_default):
-            c1, c2, c3 = st.columns([3, 1.5, 2.5])
-            with c1:
-                item = st.text_input("항목", value=r.get("item", ""), key=f"sga_item_{i}")
-            with c2:
-                typ0 = normalize_sga_type(r.get("type", "고정"))
-                typ = st.selectbox("구분", ["고정", "변동"], index=["고정", "변동"].index(typ0), key=f"sga_type_{i}")
-            with c3:
-                amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"sga_amt_{i}")
-            sga_rows.append({"item": item, "type": typ, "amount": float(amt)})
+            st.markdown("### 법인세 설정")
+            tax_mode = st.selectbox("법인세 반영 방식", ["AUTO", "MANUAL", "OFF"],
+                                    index=["AUTO", "MANUAL", "OFF"].index(tax_mode_default))
+            include_local_tax = st.checkbox("지방소득세(국세의 10%) 포함(추정)", value=include_local_default)
+            tax_manual = 0.0
+            if tax_mode == "MANUAL":
+                tax_manual = st.number_input("법인세비용(수동 입력)", value=tax_manual_default, step=1000.0, format="%.0f")
 
-        st.divider()
-        st.caption("판관비 항목 추가(선택)")
-        add_name = st.text_input("새 판관비 항목명", value="", key="sga_new_name")
-        add_type = st.selectbox("새 항목 구분", ["고정", "변동"], key="sga_new_type")
-        add_amt = st.number_input("새 항목 금액", value=0.0, step=1000.0, format="%.0f", key="sga_new_amt")
+        payload = {
+            "sales": float(sales),
+            "beg_fg": float(beg_fg),
+            "end_fg": float(end_fg),
+            "cost_items": cost_items,
+            "sga_rows": st.session_state.get("sga_rows_work", sga_rows),
+            "nonop_income_rows": st.session_state.get("nonop_income_work", nonop_income_rows),
+            "nonop_expense_rows": st.session_state.get("nonop_expense_work", nonop_expense_rows),
+            "tax_mode": tax_mode,
+            "tax_manual": float(tax_manual) if tax_mode == "MANUAL" else float(tax_manual_default),
+            "include_local_tax": bool(include_local_tax),
+            "auto_dm_used": bool(auto_dm_used),
+        }
 
-        if st.button("판관비 항목 추가", use_container_width=True):
-            if add_name.strip():
-                sga_rows.append({"item": add_name.strip(), "type": add_type, "amount": float(add_amt)})
-                st.success("추가됨! (저장 버튼을 누르면 다음에도 유지됩니다)")
-            else:
-                st.warning("항목명을 입력해 주세요.")
-
-        st.markdown("### 영업외 수익/비용")
-        with st.expander("영업외수익", expanded=False):
-            nonop_income_rows = []
-            for i, r in enumerate(nonop_income_default):
-                c1, c2 = st.columns([3, 2])
-                with c1:
-                    item = st.text_input("항목", value=r.get("item", ""), key=f"noi_item_{i}")
-                with c2:
-                    amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"noi_amt_{i}")
-                nonop_income_rows.append({"item": item, "amount": float(amt)})
-
-        with st.expander("영업외비용", expanded=False):
-            nonop_expense_rows = []
-            for i, r in enumerate(nonop_expense_default):
-                c1, c2 = st.columns([3, 2])
-                with c1:
-                    item = st.text_input("항목", value=r.get("item", ""), key=f"noe_item_{i}")
-                with c2:
-                    amt = st.number_input("금액", value=float(r.get("amount", 0.0)), step=1000.0, format="%.0f", key=f"noe_amt_{i}")
-                nonop_expense_rows.append({"item": item, "amount": float(amt)})
-
-        st.markdown("### 법인세 설정")
-        tax_mode = st.selectbox("법인세 반영 방식", ["AUTO", "MANUAL", "OFF"],
-                                index=["AUTO", "MANUAL", "OFF"].index(tax_mode_default))
-        include_local_tax = st.checkbox("지방소득세(국세의 10%) 포함(추정)", value=include_local_default)
-        tax_manual = 0.0
-        if tax_mode == "MANUAL":
-            tax_manual = st.number_input("법인세비용(수동 입력)", value=tax_manual_default, step=1000.0, format="%.0f")
-
-    payload = {
-        "sales": float(sales),
-        "beg_fg": float(beg_fg),
-        "end_fg": float(end_fg),
-        "cost_items": cost_items,
-        "sga_rows": sga_rows,
-        "nonop_income_rows": nonop_income_rows,
-        "nonop_expense_rows": nonop_expense_rows,
-        "tax_mode": tax_mode,
-        "tax_manual": float(tax_manual) if tax_mode == "MANUAL" else float(tax_manual_default),
-        "include_local_tax": bool(include_local_tax),
-        "auto_dm_used": bool(auto_dm_used),
-    }
-
-    s1, s2 = st.columns(2)
-    with s1:
-        if st.button("저장", use_container_width=True):
-            save_period(int(year), int(month), payload)
-            st.success("저장 완료")
-    with s2:
-        if st.button("초기화(이번 달)", use_container_width=True):
-            save_period(int(year), int(month), {})
-            st.warning("초기화 완료")
+        s1, s2 = st.columns(2)
+        with s1:
+            if st.button("저장", use_container_width=True):
+                save_period(company_selected, int(year), int(month), payload)
+                st.success(f"저장 완료 ({company_selected})")
+                st.session_state["_work_period_key"] = pkey
+                st.session_state["sga_rows_work"] = payload["sga_rows"]
+                st.session_state["nonop_income_work"] = payload["nonop_income_rows"]
+                st.session_state["nonop_expense_work"] = payload["nonop_expense_rows"]
+        with s2:
+            if st.button("초기화(이번 달)", use_container_width=True):
+                save_period(company_selected, int(year), int(month), {})
+                st.warning("초기화 완료")
+                st.session_state["_work_period_key"] = None
+                st.rerun()
 
 
 # -----------------------------
-# Current compute
+# Current compute (선택월)
 # -----------------------------
-p = PeriodInput(
-    sales=float(payload["sales"]),
-    beg_fg=float(payload["beg_fg"]),
-    end_fg=float(payload["end_fg"]),
-    cost_items=payload["cost_items"],
-    sga_rows=[{"item": r["item"], "type": normalize_sga_type(r["type"]), "amount": float(r["amount"])} for r in payload["sga_rows"]],
-    nonop_income_rows=[{"item": r["item"], "amount": float(r["amount"])} for r in payload["nonop_income_rows"]],
-    nonop_expense_rows=[{"item": r["item"], "amount": float(r["amount"])} for r in payload["nonop_expense_rows"]],
-    tax_mode=payload["tax_mode"],
-    tax_manual=float(payload.get("tax_manual", 0.0)),
-    include_local_tax=bool(payload.get("include_local_tax", True)),
-)
-out = compute_all(p)
-df_cost = df_cost_statement(p.cost_items, out["cogm"])
-df_pl = df_pl_statement(p, out)
-df_bep_tbl = df_bep(out, out["sga_fixed"], p.sales)
+if company_selected == GROUP_OPTION:
+    pack = load_periods_range_group(int(year), [int(month)], COMPANIES)[0]
+    payloads = pack.get("_payloads", [])
+    if payloads:
+        p, out = compute_all_group(payloads)
+        df_cost = df_cost_statement(p.cost_items, out["cogm"])
+        df_pl = df_pl_statement(p, out)
+        df_bep_tbl = df_bep(out, out["sga_fixed"], p.sales)
+    else:
+        p = PeriodInput(0, 0, 0, build_default_cost_items(), build_default_sga_rows(),
+                        build_default_nonop_rows(DEFAULT_NONOP_INCOME),
+                        build_default_nonop_rows(DEFAULT_NONOP_EXPENSE),
+                        "OFF", 0.0, True)
+        out = compute_all(p)
+        df_cost = df_cost_statement(p.cost_items, out["cogm"])
+        df_pl = df_pl_statement(p, out)
+        df_bep_tbl = df_bep(out, out["sga_fixed"], p.sales)
+else:
+    curr_payload = load_period(company_selected, int(year), int(month))
+    if not curr_payload:
+        curr_payload = {}
+    p = payload_to_period_input(curr_payload)
+    out = compute_all(p)
+    df_cost = df_cost_statement(p.cost_items, out["cogm"])
+    df_pl = df_pl_statement(p, out)
+    df_bep_tbl = df_bep(out, out["sga_fixed"], p.sales)
 
 
 # -----------------------------
@@ -1141,6 +1375,9 @@ df_bep_tbl = df_bep(out, out["sga_fixed"], p.sales)
 # -----------------------------
 with tab2:
     st.subheader("2) 결과 (선택월)")
+
+    if company_selected == GROUP_OPTION:
+        st.caption(f"합산 기준 회사: {', '.join(COMPANIES)}")
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("당기제조원가", to_money(out["cogm"]))
@@ -1156,17 +1393,6 @@ with tab2:
     c7.metric("BEP 매출액", to_money(out["bep_sales"]))
     c8.metric("BEP 대비 매출", to_money(out["gap_sales_vs_bep"]))
 
-    st.caption("※ 직접재료비는 '당기사용원재료'만 원가 반영 (기초/입고/기말은 참고).")
-
-    if out["tax_info"]:
-        d = out["tax_info"]["detail"]
-        st.caption(
-            f"법인세(추정): {out['tax_info']['note']} | "
-            f"연환산 과세표준 {to_money(out['tax_info']['annualized_tax_base'])}원 | "
-            f"국세 {to_money(d['national_cit'])} + 지방(10%가정) {to_money(d['local_income_tax'])}"
-        )
-    else:
-        st.caption("법인세: " + ("미반영(OFF)" if p.tax_mode == "OFF" else "수동 입력(MANUAL)"))
 
     left, right = st.columns(2)
     with left:
@@ -1202,104 +1428,30 @@ with tab3:
     else:
         period_label = f"{selected_year} 연도전체(저장분)"
 
-    payloads = load_periods_range(selected_year, months)
-
-    if not payloads:
-        st.warning("선택한 기간에 저장된 데이터가 없습니다. (입력 탭에서 저장 후 다시 확인)")
-    else:
-        expected = set(months)
-        included = set(int(pp.get("_month", 0)) for pp in payloads)
-        missing = sorted(list(expected - included))
-        if missing:
-            st.info(f"저장되지 않은 월은 누적에서 제외됩니다: {', '.join(map(str, missing))}")
-
-        agg = aggregate_periods(payloads)
-
-        a1, a2, a3, a4 = st.columns(4)
-        a1.metric("누적 매출액", to_money(agg["sales"]))
-        a2.metric("누적 영업이익", to_money(agg["op_profit"]))
-        a3.metric("누적 당기순이익", to_money(agg["net_income"]))
-        a4.metric("누적 공헌이익률", f"{agg['cm_ratio']*100:,.1f}% ({agg['grade']})")
-
-        st.caption(f"포함 월: {', '.join([str(m) for m in sorted([x for x in agg['months_included'] if x])])}")
-
-        df_agg_pl = build_agg_pl_df(agg)
-        st.markdown("### 누적 손익계산서 요약")
-        st.dataframe(df_agg_pl, use_container_width=True, hide_index=True, height=420)
-
-        st.markdown("### 누적 BEP / 공헌이익")
-        df_agg_bep = pd.DataFrame([
-            ["변동비 합계(매출원가+판관비 변동)", agg["variable_total"]],
-            ["공헌이익", agg["cm"]],
-            ["공헌이익률", agg["cm_ratio"]],
-            ["고정비(판관비 고정)", agg["sga_fixed"]],
-            ["BEP 매출액", agg["bep_sales"]],
-            ["BEP 대비 매출", agg["gap_sales_vs_bep"]],
-            ["공헌이익률 등급", agg["grade"]],
-        ], columns=["항목", "값"])
-        st.dataframe(df_agg_bep, use_container_width=True, hide_index=True, height=300)
-
-
-# -----------------------------
-# TAB4: DOWNLOAD
-# -----------------------------
-with tab4:
-    st.subheader("4) 리포트 다운로드 (월별/분기누적/YTD/연도전체 원클릭)")
-
-    rpt_type = st.selectbox("리포트 기준 선택", ["월별(선택월)", "분기누적(QTD)", "연도누적(YTD)", "연도전체(저장된 월 합산)"])
-    selected_year = int(year)
-    selected_month = int(month)
-
-    months = months_for_period(selected_month, rpt_type)
-
-    if rpt_type == "월별(선택월)":
-        period_label = f"{selected_year}-{selected_month:02d}"
-        title = f"{selected_year}년 {selected_month:02d}월 경영분석 리포트(월별)"
-        mode = "MONTH"
-    elif rpt_type == "분기누적(QTD)":
-        q = (selected_month - 1) // 3 + 1
-        period_label = f"{selected_year} Q{q} (저장분)"
-        title = f"{selected_year}년 Q{q} 누적 경영분석 리포트(QTD)"
-        mode = "QTD"
-    elif rpt_type == "연도누적(YTD)":
-        period_label = f"{selected_year} YTD (저장분)"
-        title = f"{selected_year}년 누적 경영분석 리포트(YTD)"
-        mode = "YTD"
-    else:
-        period_label = f"{selected_year} 연도전체(저장분)"
-        title = f"{selected_year}년 연도전체 경영분석 리포트"
-        mode = "YEAR"
-
-    payloads = load_periods_range(selected_year, months)
-
-    if not payloads:
-        st.warning("선택한 기간에 저장된 데이터가 없습니다. (입력 탭에서 저장 후 다시 시도)")
-    else:
-        expected = set(months)
-        included = set(int(pp.get("_month", 0)) for pp in payloads)
-        missing = sorted(list(expected - included))
-        if missing:
-            st.info(f"저장되지 않은 월은 리포트 누적에서 제외됩니다: {', '.join(map(str, missing))}")
-
-        if mode == "MONTH":
-            sales_base = p.sales
-            rpt_out = out
-            rpt_df_pl = df_pl
-            rpt_df_cost = df_cost
-            rpt_tax_mode = p.tax_mode
-            rpt_tax_info = out["tax_info"]
-            rpt_bep = df_bep_tbl
-            extra = {
-                "판관비_상세": pd.DataFrame(p.sga_rows),
-                "영업외수익": pd.DataFrame(p.nonop_income_rows),
-                "영업외비용": pd.DataFrame(p.nonop_expense_rows),
-            }
+    if company_selected == GROUP_OPTION:
+        agg, included = aggregate_periods_group(selected_year, months, COMPANIES)
+        if not agg:
+            st.warning("선택한 기간에 저장된 데이터가 없습니다. (회사별 입력 탭에서 월별 저장 후 다시 확인)")
         else:
-            agg = aggregate_periods(payloads)
-            sales_base = agg["sales"]
+            expected = set(months)
+            missing = sorted(list(expected - set(included)))
+            if missing:
+                st.info(f"저장되지 않은 월은 누적에서 제외됩니다: {', '.join(map(str, missing))}")
 
-            rpt_df_pl = build_agg_pl_df(agg)
-            rpt_bep = pd.DataFrame([
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("누적 매출액", to_money(agg["sales"]))
+            a2.metric("누적 영업이익", to_money(agg["op_profit"]))
+            a3.metric("누적 당기순이익", to_money(agg["net_income"]))
+            a4.metric("누적 공헌이익률", f"{agg['cm_ratio']*100:,.1f}% ({agg['grade']})")
+
+            st.caption(f"포함 월: {', '.join([str(m) for m in included])}")
+
+            df_agg_pl = build_agg_pl_df(agg)
+            st.markdown("### 누적 손익계산서 요약")
+            st.dataframe(df_agg_pl, use_container_width=True, hide_index=True, height=420)
+
+            st.markdown("### 누적 BEP / 공헌이익")
+            df_agg_bep = pd.DataFrame([
                 ["변동비 합계(매출원가+판관비 변동)", agg["variable_total"]],
                 ["공헌이익", agg["cm"]],
                 ["공헌이익률", agg["cm_ratio"]],
@@ -1308,239 +1460,92 @@ with tab4:
                 ["BEP 대비 매출", agg["gap_sales_vs_bep"]],
                 ["공헌이익률 등급", agg["grade"]],
             ], columns=["항목", "값"])
+            st.dataframe(df_agg_bep, use_container_width=True, hide_index=True, height=300)
 
-            rpt_df_cost = None
-            rpt_tax_mode = "AGG"
-            rpt_tax_info = None
-            rpt_out = {
-                "op_profit": agg["op_profit"],
-                "cm_ratio": agg["cm_ratio"],
-                "grade": agg["grade"],
-                "bep_sales": agg["bep_sales"],
-                "op_margin": safe_div(agg["op_profit"], sales_base),
-            }
-            extra = {"포함월": pd.DataFrame({"월": [int(pp.get("_month", 0)) for pp in payloads]})}
+    else:
+        payloads = load_periods_range(company_selected, selected_year, months)
+        if not payloads:
+            st.warning("선택한 기간에 저장된 데이터가 없습니다. (입력 탭에서 저장 후 다시 확인)")
+        else:
+            expected = set(months)
+            included_m = set(int(pp.get("_month", 0)) for pp in payloads)
+            missing = sorted(list(expected - included_m))
+            if missing:
+                st.info(f"저장되지 않은 월은 누적에서 제외됩니다: {', '.join(map(str, missing))}")
 
-        report_html = build_report_html(
-            title=title,
-            period_label=period_label,
-            sales_base=sales_base,
-            out=rpt_out,
-            df_pl=rpt_df_pl,
-            df_cost=rpt_df_cost,
-            tax_mode=rpt_tax_mode if mode != "MONTH" else p.tax_mode,
-            tax_info=rpt_tax_info
-        )
+            agg = aggregate_periods(payloads)
 
-        pdf_bytes = make_pdf_report(
-            title=title,
-            period_label=period_label,
-            sales_base=sales_base,
-            out=rpt_out,
-            df_pl=rpt_df_pl,
-            tax_mode=rpt_tax_mode if mode != "MONTH" else p.tax_mode,
-            tax_info=rpt_tax_info
-        )
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("누적 매출액", to_money(agg["sales"]))
+            a2.metric("누적 영업이익", to_money(agg["op_profit"]))
+            a3.metric("누적 당기순이익", to_money(agg["net_income"]))
+            a4.metric("누적 공헌이익률", f"{agg['cm_ratio']*100:,.1f}% ({agg['grade']})")
 
-        excel_bytes = make_excel_report(
-            df_pl=rpt_df_pl,
-            df_cost=rpt_df_cost,
-            df_bep_tbl=rpt_bep,
-            extra_sheets=extra
-        )
+            st.caption(f"포함 월: {', '.join([str(m) for m in sorted([x for x in agg['months_included'] if x])])}")
 
-        b1, b2, b3 = st.columns(3)
-        with b1:
-            st.download_button("리포트 PDF 다운로드", pdf_bytes,
-                               file_name=f"report_{selected_year}_{selected_month:02d}_{mode}.pdf",
-                               mime="application/pdf", use_container_width=True)
-        with b2:
-            st.download_button("리포트 HTML 다운로드", report_html,
-                               file_name=f"report_{selected_year}_{selected_month:02d}_{mode}.html",
-                               mime="text/html", use_container_width=True)
-        with b3:
-            st.download_button("리포트 Excel 다운로드", excel_bytes,
-                               file_name=f"report_{selected_year}_{selected_month:02d}_{mode}.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                               use_container_width=True)
+            df_agg_pl = build_agg_pl_df(agg)
+            st.markdown("### 누적 손익계산서 요약")
+            st.dataframe(df_agg_pl, use_container_width=True, hide_index=True, height=420)
 
-        st.divider()
-        st.markdown("### 리포트 미리보기(HTML)")
-        st.components.v1.html(report_html, height=650, scrolling=True)
+            st.markdown("### 누적 BEP / 공헌이익")
+            df_agg_bep = pd.DataFrame([
+                ["변동비 합계(매출원가+판관비 변동)", agg["variable_total"]],
+                ["공헌이익", agg["cm"]],
+                ["공헌이익률", agg["cm_ratio"]],
+                ["고정비(판관비 고정)", agg["sga_fixed"]],
+                ["BEP 매출액", agg["bep_sales"]],
+                ["BEP 대비 매출", agg["gap_sales_vs_bep"]],
+                ["공헌이익률 등급", agg["grade"]],
+            ], columns=["항목", "값"])
+            st.dataframe(df_agg_bep, use_container_width=True, hide_index=True, height=300)
 
 
 # -----------------------------
-# TAB5: COMPARE + TREND + DOWNLOAD(A/B)
+# TAB5: 비교분석 (그래프 없음)
 # -----------------------------
 with tab5:
-    st.subheader("5) 비교분석 · 월별 누적 그래프")
-    st.markdown("## A) 월별/분기/연도 비교분석")
-    st.caption("두 기간을 선택하면 A와 B를 나란히 비교하고 차이를 보여줍니다. (저장된 월만 집계)")
+    st.subheader("회사별 비교분석 (그래프 없음)")
 
-    def build_period_aggregate(year_: int, anchor_month_: int, kind_: str):
-        months_ = months_for_period(anchor_month_, kind_)
-        payloads_ = load_periods_range(year_, months_)
+    months = [int(month)]
+    rows = []
 
-        if kind_ == "월별(선택월)":
-            label_ = f"{year_}-{anchor_month_:02d}"
-        elif kind_ == "분기누적(QTD)":
-            q_ = (anchor_month_ - 1) // 3 + 1
-            label_ = f"{year_} Q{q_} (저장분)"
-        elif kind_ == "연도누적(YTD)":
-            label_ = f"{year_} YTD (저장분)"
-        else:
-            label_ = f"{year_} 연도전체(저장분)"
+    packs = load_periods_range_group(int(year), months, COMPANIES)
 
-        if not payloads_:
-            return {}, label_, []
-        agg_ = aggregate_periods(payloads_)
-        included_ = sorted([int(x) for x in agg_.get("months_included", []) if x])
-        return agg_, label_, included_
+    for pack in packs:
+        for company, payload in pack.get("_payloads", []):
+            p = payload_to_period_input(payload)
+            out = compute_all(p)
+            rows.append({
+                "회사": company,
+                "매출액": p.sales,
+                "영업이익": out["op_profit"],
+                "당기순이익": out["net_income"],
+                "공헌이익률": out["cm_ratio"],
+                "고정비": out["sga_fixed"],
+                "BEP매출액": out["bep_sales"],
+                "BEP대비매출": out["gap_sales_vs_bep"],
+            })
 
-    colA, colB = st.columns(2)
-
-    with colA:
-        st.markdown("### 비교기간 A")
-        a_year = st.number_input("A 연도", min_value=2000, max_value=2100, value=int(year), step=1, key="a_year")
-        a_month = st.number_input("A 기준월(앵커)", min_value=1, max_value=12, value=int(month), step=1, key="a_month")
-        a_kind = st.selectbox("A 기준", ["월별(선택월)", "분기누적(QTD)", "연도누적(YTD)", "연도전체(저장된 월 합산)"], key="a_kind")
-        agg_a, label_a, included_a = build_period_aggregate(int(a_year), int(a_month), a_kind)
-
-    with colB:
-        st.markdown("### 비교기간 B")
-        b_year = st.number_input("B 연도", min_value=2000, max_value=2100, value=int(year), step=1, key="b_year")
-        b_month = st.number_input("B 기준월(앵커)", min_value=1, max_value=12, value=max(1, int(month) - 1), step=1, key="b_month")
-        b_kind = st.selectbox("B 기준", ["월별(선택월)", "분기누적(QTD)", "연도누적(YTD)", "연도전체(저장된 월 합산)"], key="b_kind")
-        agg_b, label_b, included_b = build_period_aggregate(int(b_year), int(b_month), b_kind)
-
-    if not agg_a or not agg_b:
-        st.warning("A 또는 B 기간에 저장된 데이터가 없습니다. (입력 탭에서 월별 저장 후 비교해 주세요.)")
+    if not rows:
+        st.warning("비교할 데이터가 없습니다.")
     else:
-        st.success(f"A: {label_a} | 포함월: {included_a}  /  B: {label_b} | 포함월: {included_b}")
+        df = pd.DataFrame(rows)
 
-        comp_df = compare_two(agg_a, agg_b)
-        st.markdown("### 비교표 (A vs B)")
-        st.dataframe(comp_df, use_container_width=True, hide_index=True, height=520)
+        st.markdown("### 회사별 KPI 비교")
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-        st.divider()
-        st.markdown("### A기간 vs B기간 리포트 다운로드 (PDF/HTML/Excel)")
-
-        df_a_pl = build_agg_pl_df(agg_a)
-        df_b_pl = build_agg_pl_df(agg_b)
-
-        html_ab = build_compare_report_html(
-            title="A기간 vs B기간 비교 리포트",
-            label_a=label_a,
-            label_b=label_b,
-            agg_a=agg_a,
-            agg_b=agg_b,
-            comp_df=comp_df
+        st.markdown("### 공헌이익률 랭킹")
+        st.dataframe(
+            df.sort_values("공헌이익률", ascending=False)[["회사", "공헌이익률"]],
+            use_container_width=True, hide_index=True
         )
 
-        excel_bytes_ab = make_excel_report(
-            df_pl=df_a_pl,
-            df_cost=None,
-            df_bep_tbl=pd.DataFrame([
-                ["(A기간) 공헌이익률", agg_a["cm_ratio"]],
-                ["(A기간) BEP매출액", agg_a["bep_sales"]],
-                ["(B기간) 공헌이익률", agg_b["cm_ratio"]],
-                ["(B기간) BEP매출액", agg_b["bep_sales"]],
-            ], columns=["항목", "값"]),
-            extra_sheets={
-                "B_손익요약": df_b_pl,
-                "A_vs_B_비교표": comp_df,
-            }
+        st.markdown("### BEP 미달 회사")
+        st.dataframe(
+            df[df["BEP대비매출"] < 0][["회사", "BEP대비매출"]],
+            use_container_width=True, hide_index=True
         )
 
-        out_a_pdf = {
-            "op_profit": agg_a["op_profit"],
-            "cm_ratio": agg_a["cm_ratio"],
-            "grade": grade_cm_ratio(agg_a["cm_ratio"]),
-            "bep_sales": agg_a["bep_sales"],
-            "op_margin": safe_div(agg_a["op_profit"], agg_a["sales"]),
-        }
-        out_b_pdf = {
-            "op_profit": agg_b["op_profit"],
-            "cm_ratio": agg_b["cm_ratio"],
-            "grade": grade_cm_ratio(agg_b["cm_ratio"]),
-            "bep_sales": agg_b["bep_sales"],
-            "op_margin": safe_div(agg_b["op_profit"], agg_b["sales"]),
-        }
 
-        pdf_a = make_pdf_report(
-            title=f"[A] {label_a} 경영분석 리포트",
-            period_label=label_a,
-            sales_base=agg_a["sales"],
-            out=out_a_pdf,
-            df_pl=df_a_pl,
-            tax_mode="AGG",
-            tax_info=None
-        )
-        pdf_b = make_pdf_report(
-            title=f"[B] {label_b} 경영분석 리포트",
-            period_label=label_b,
-            sales_base=agg_b["sales"],
-            out=out_b_pdf,
-            df_pl=df_b_pl,
-            tax_mode="AGG",
-            tax_info=None
-        )
-
-        pdf_ab_merged = None
-        if HAS_PYPDF2:
-            try:
-                pdf_ab_merged = merge_pdfs([pdf_a, pdf_b])
-            except Exception:
-                pdf_ab_merged = None
-
-        d1, d2, d3 = st.columns(3)
-        with d1:
-            st.download_button("비교리포트 HTML 다운로드", html_ab, file_name="compare_A_vs_B.html",
-                               mime="text/html", use_container_width=True)
-        with d2:
-            st.download_button("비교리포트 Excel 다운로드", excel_bytes_ab, file_name="compare_A_vs_B.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-        with d3:
-            if pdf_ab_merged is not None:
-                st.download_button("비교리포트 PDF 다운로드(1파일)", pdf_ab_merged, file_name="compare_A_vs_B.pdf",
-                                   mime="application/pdf", use_container_width=True)
-            else:
-                st.download_button("A리포트 PDF 다운로드", pdf_a, file_name="report_A.pdf",
-                                   mime="application/pdf", use_container_width=True)
-                st.download_button("B리포트 PDF 다운로드", pdf_b, file_name="report_B.pdf",
-                                   mime="application/pdf", use_container_width=True)
-
-        st.markdown("#### 비교리포트 미리보기(HTML)")
-        st.components.v1.html(html_ab, height=520, scrolling=True)
-
-    st.divider()
-    st.markdown("## B) 월별 누적 그래프(매출액/영업이익/당기순이익)")
-    trend_year = st.number_input("그래프 연도 선택", min_value=2000, max_value=2100, value=int(year), step=1, key="trend_year")
-    df_trend = build_year_month_table_for_trend(int(trend_year))
-
-    if df_trend.empty:
-        st.warning("선택한 연도에 저장된 데이터가 없습니다.")
-    else:
-        st.caption("저장된 월만 표시됩니다. (월별 입력 후 저장하면 자동으로 누적선이 연결됩니다.)")
-
-        st.markdown("### 월별 값(단월)")
-        df_monthly_chart = df_trend.set_index("월")[["매출액", "영업이익", "당기순이익"]]
-        plot_lines_matplotlib(df_monthly_chart, title="월별: 매출액/영업이익/당기순이익", height_px=320)
-
-        st.markdown("### 누적 값(연도 누적)")
-        df_cum_chart = df_trend.set_index("월")[["누적매출", "누적영업이익", "누적당기순이익"]]
-        plot_lines_matplotlib(df_cum_chart, title="누적: 매출/영업이익/순이익", height_px=320)
-
-        st.markdown("### 월별 상세표")
-        show_cols = ["월", "매출액", "영업이익", "당기순이익", "누적매출", "누적영업이익", "누적당기순이익", "공헌이익률", "BEP매출액"]
-        df_show = df_trend[show_cols].copy()
-        df_show["공헌이익률"] = df_show["공헌이익률"].apply(lambda x: f"{x*100:,.1f}%")
-        st.dataframe(df_show, use_container_width=True, hide_index=True, height=420)
-
-
-# =============================
-# Footer
-# =============================
 st.divider()
 st.caption(f"버전: v{APP_VERSION} | 개발자: {DEVELOPER_NAME} | {COPYRIGHT_TEXT}")
-
