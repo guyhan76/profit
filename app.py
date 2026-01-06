@@ -1,5 +1,6 @@
 # app.py  (v0.6.8)  v0.6.3 UI 유지 + 5개 회사 입력/합산 + LEGACY 제거 + DB 정리
 # ✅ 변경: 기존 BEP(영업이익=0) 제거, "이자 포함 BEP"만 표시/사용
+
 import streamlit as st
 import pandas as pd
 import sqlite3
@@ -1290,6 +1291,144 @@ with tab3:
 # -----------------------------
 # TAB4: 리포트 다운로드 (UI 자리만 유지)
 # -----------------------------
+
+def build_report_html(title: str, period_label: str, sales_base: float, out: dict,
+                      df_pl: pd.DataFrame, df_cost: pd.DataFrame | None,
+                      tax_mode: str, tax_info: dict | None) -> str:
+    tax_note = ""
+    if tax_info:
+        d = tax_info.get("detail", {})
+        tax_note = f"""
+        <p><b>법인세(표시/추정)</b><br/>
+        연환산 과세표준: {tax_info.get("annualized_tax_base", 0):,.0f}원<br/>
+        국세 법인세: {d.get("national_cit", 0):,.0f}원 / 지방소득세(가정): {d.get("local_income_tax", 0):,.0f}원<br/>
+        ({d.get("assumption", "")})
+        </p>
+        """
+    else:
+        if tax_mode == "OFF":
+            tax_note = "<p><b>법인세:</b> 미반영(0원)</p>"
+        elif tax_mode == "MANUAL":
+            tax_note = "<p><b>법인세:</b> 수동 입력값 반영</p>"
+
+    cost_block = ""
+    if df_cost is not None:
+        cost_block = f"""
+        <h3>제조원가명세서(당기제조원가 대비 비율)</h3>
+        <p><small>※ 직접재료비는 '당기사용원재료'만 원가에 반영됩니다. 기초/입고/기말은 참고 표시입니다.</small></p>
+        {df_cost.to_html(index=False)}
+        """
+
+    html = f"""
+    <h2>{title}</h2>
+    <p><b>기간:</b> {period_label}</p>
+
+    <h3>핵심 KPI</h3>
+    <ul>
+      <li>매출액: {sales_base:,.0f}</li>
+      <li>영업이익: {out.get('op_profit',0):,.0f} (영업이익률 {out.get('op_margin',0)*100:,.1f}%)</li>
+      <li>공헌이익률: {out.get('cm_ratio',0)*100:,.1f}% → <b>{out.get('grade','')}</b></li>
+      <li>이자포함 BEP 매출액: {out.get('interest_bep_sales',0):,.0f}</li>
+      <li>이자포함 BEP 대비 매출: {out.get('gap_sales_vs_interest_bep',0):,.0f}</li>
+    </ul>
+
+    {tax_note}
+
+    <h3>손익계산서 요약</h3>
+    {df_pl.to_html(index=False)}
+
+    {cost_block}
+
+    <hr/>
+    <p><small>
+    ※ 본 리포트는 경영관리 목적의 자동 산출 결과입니다.
+    특히 법인세는 추정/합산 방식에 따라 실제 신고세액과 차이가 있을 수 있습니다.
+    </small></p>
+    """
+    return html
+
+
+def make_excel_report(df_pl: pd.DataFrame, df_cost: pd.DataFrame | None,
+                      df_bep_tbl: pd.DataFrame, extra_sheets: dict[str, pd.DataFrame] | None = None) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df_pl.to_excel(writer, index=False, sheet_name="손익요약")
+        df_bep_tbl.to_excel(writer, index=False, sheet_name="BEP")
+        if df_cost is not None:
+            df_cost.to_excel(writer, index=False, sheet_name="제조원가")
+        if extra_sheets:
+            for name, df in extra_sheets.items():
+                df.to_excel(writer, index=False, sheet_name=name[:31])
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def make_pdf_report(title: str, period_label: str, sales_base: float, out: dict,
+                    df_pl: pd.DataFrame, tax_mode: str, tax_info: dict | None) -> bytes:
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    font = register_korean_font_if_possible()
+
+    c.setFont(font, 14)
+    c.drawString(18 * mm, height - 18 * mm, title)
+
+    c.setFont(font, 11)
+    y = height - 28 * mm
+    line = 6.5 * mm
+
+    c.drawString(18 * mm, y, f"기간: {period_label}")
+    y -= line
+
+    c.drawString(18 * mm, y, f"매출액: {to_money(sales_base)}")
+    y -= line
+    c.drawString(18 * mm, y, f"영업이익: {to_money(out.get('op_profit',0))}")
+    y -= line
+    c.drawString(18 * mm, y, f"공헌이익률: {out.get('cm_ratio',0)*100:,.1f}% ({out.get('grade','')})")
+    y -= line
+    c.drawString(18 * mm, y, f"이자포함 BEP 매출액: {to_money(out.get('interest_bep_sales',0))}")
+    y -= (line * 1.2)
+
+    if tax_info:
+        d = tax_info.get("detail", {})
+        c.drawString(18 * mm, y, f"법인세(표시): {tax_info.get('note','')}")
+        y -= line
+        c.drawString(18 * mm, y, f"- 합계 {to_money(d.get('total_tax',0))}")
+        y -= (line * 1.2)
+    else:
+        if tax_mode == "OFF":
+            c.drawString(18 * mm, y, "법인세: 미반영(0원)")
+            y -= (line * 1.2)
+        elif tax_mode == "MANUAL":
+            c.drawString(18 * mm, y, "법인세: 수동 입력값 반영")
+            y -= (line * 1.2)
+
+    c.setFont(font, 12)
+    c.drawString(18 * mm, y, "손익계산서 요약")
+    y -= (line * 1.2)
+
+    c.setFont(font, 10)
+    for _, row in df_pl.iterrows():
+        item = str(row["항목"])
+        amt = float(row["금액"])
+        ratio = str(row.get("매출액 대비 비율", ""))
+
+        c.drawString(20 * mm, y, item)
+        c.drawRightString(width - 50 * mm, y, f"{amt:,.0f}")
+        c.drawRightString(width - 18 * mm, y, ratio)
+
+        y -= line
+        if y < 18 * mm:
+            c.showPage()
+            c.setFont(font, 10)
+            y = height - 18 * mm
+
+    c.showPage()
+    c.save()
+    buf.seek(0)
+    return buf.getvalue()
+
 
 # -----------------------------
 # TAB4: REPORT DOWNLOAD (PDF / Excel / HTML)
