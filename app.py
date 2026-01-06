@@ -1290,9 +1290,78 @@ with tab3:
 # -----------------------------
 # TAB4: 리포트 다운로드 (UI 자리만 유지)
 # -----------------------------
+
+# -----------------------------
+# TAB4: REPORT DOWNLOAD (PDF / Excel / HTML)
+# -----------------------------
 with tab4:
     st.subheader("4) 리포트 다운로드")
-    st.info("현재 버전(v0.6.7)은 리포트 다운로드 UI를 비워두었습니다. (필요하시면 PDF/엑셀 다운로드 버튼을 다시 붙여드릴게요.)")
+
+    # ✅ 현재 화면(선택월) 기준 리포트 생성
+    report_title = f"경영분석 리포트 ({company_selected} {int(year)}-{int(month):02d})"
+    period_label = f"{int(year)}-{int(month):02d}"
+    sales_base = float(p.sales)
+
+    html = build_report_html(
+        title=report_title,
+        period_label=period_label,
+        sales_base=sales_base,
+        out=out,
+        df_pl=df_pl,
+        df_cost=df_cost,
+        tax_mode=getattr(p, "tax_mode", "OFF"),
+        tax_info=out.get("tax_info", None),
+    )
+
+    # ✅ 엑셀: 손익요약 + BEP + 제조원가
+    excel_bytes = make_excel_report(
+        df_pl=df_pl,
+        df_cost=df_cost,
+        df_bep_tbl=df_bep_tbl,
+        extra_sheets=None,
+    )
+
+    # ✅ PDF: 손익요약 중심(간단)
+    pdf_bytes = make_pdf_report(
+        title=report_title,
+        period_label=period_label,
+        sales_base=sales_base,
+        out=out,
+        df_pl=df_pl,
+        tax_mode=getattr(p, "tax_mode", "OFF"),
+        tax_info=out.get("tax_info", None),
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.download_button(
+            "📥 엑셀 다운로드 (.xlsx)",
+            data=excel_bytes,
+            file_name=f"report_{company_selected}_{int(year)}_{int(month):02d}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+    with c2:
+        st.download_button(
+            "📥 PDF 다운로드 (.pdf)",
+            data=pdf_bytes,
+            file_name=f"report_{company_selected}_{int(year)}_{int(month):02d}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    with c3:
+        st.download_button(
+            "📥 HTML 다운로드 (.html)",
+            data=html.encode("utf-8"),
+            file_name=f"report_{company_selected}_{int(year)}_{int(month):02d}.html",
+            mime="text/html",
+            use_container_width=True,
+        )
+
+    st.caption("※ 리포트는 현재 화면(선택월) 계산 결과를 그대로 내보냅니다.")
 
 
 # -----------------------------
