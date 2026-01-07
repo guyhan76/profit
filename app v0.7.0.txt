@@ -1,4 +1,4 @@
-# app.py  (v0.6.8)  v0.6.3 UI 유지 + 5개 회사 입력/합산 + LEGACY 제거 + DB 정리
+# app.py  (v0.7.0)  v0.6.3 UI 유지 + 5개 회사 입력/합산 + LEGACY 제거 + DB 정리
 # ✅ 변경: 기존 BEP(영업이익=0) 제거, "이자 포함 BEP"만 표시/사용
 
 import streamlit as st
@@ -29,7 +29,7 @@ except Exception:
 # =============================
 # App Meta
 # =============================
-APP_VERSION = "0.6.8"  # ✅ 기존 BEP 제거, 이자 포함 BEP만
+APP_VERSION = "0.7.0"  # ✅ 기존 BEP 제거, 이자 포함 BEP만
 DEVELOPER_NAME = "한동석"
 COPYRIGHT_TEXT = f"© {datetime.now().year} {DEVELOPER_NAME}. All rights reserved."
 DB_PATH = "mvp_finance.db"
